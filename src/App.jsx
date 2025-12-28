@@ -20,9 +20,13 @@ const App = () => {
     socketRef.current = io('http://localhost:4001');
 
     const socket = socketRef.current;
-
     socket.on('connect', () => {
       console.log('Connected to server:', socket.id);
+
+      // Register user with a unique ID (could be from login, localStorage, etc.)
+      const userId = localStorage.getItem('userId') || `user-${Date.now()}`;
+      localStorage.setItem('userId', userId);
+      socket.emit('register', userId);
     });
 
     socket.on('disconnect', () => {
@@ -36,14 +40,14 @@ const App = () => {
     socket.on('notification', (data) => {
       console.log('Notification received:', data);
       setNotifications((prevNotifications) => [...prevNotifications, data]);
-      
+
       if (!("Notification" in window)) {
         alert("This browser does not support desktop notification");
         return;
       }
 
       console.log('Notification.permission', Notification.permission);
-      
+
       if (Notification.permission === "granted") {
         handleNotification(data);
       } else if (Notification.permission !== "denied") {
@@ -83,7 +87,7 @@ const App = () => {
 
   const handleEnableAudio = () => {
     audioPermissionAskedRef.current = true;
-    
+
     // Play audio immediately during user interaction
     if (audioRef.current) {
       audioRef.current.play()
@@ -91,7 +95,7 @@ const App = () => {
           audioEnabledRef.current = true;
           console.log('Audio enabled successfully');
           setShowAudioPermissionModal(false);
-          
+
           // Send the pending notification
           if (pendingNotificationRef.current) {
             sendPushNotification(pendingNotificationRef.current);
@@ -102,7 +106,7 @@ const App = () => {
           console.error('Failed to enable audio:', error);
           audioEnabledRef.current = false;
           setShowAudioPermissionModal(false);
-          
+
           // Still send notification, just without sound
           if (pendingNotificationRef.current) {
             sendPushNotification(pendingNotificationRef.current);
@@ -116,7 +120,7 @@ const App = () => {
     audioPermissionAskedRef.current = true;
     audioEnabledRef.current = false;
     setShowAudioPermissionModal(false);
-    
+
     // Send the pending notification without sound
     if (pendingNotificationRef.current) {
       sendPushNotification(pendingNotificationRef.current);
@@ -136,7 +140,7 @@ const App = () => {
   const sendPushNotification = (data) => {
     // Increment counter to create unique tag for each notification
     notificationCounterRef.current += 1;
-    
+
     var notification = new Notification(data.message, {
       body: data?.body || undefined,
       icon: '/notification-bell.png',
