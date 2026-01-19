@@ -4,14 +4,20 @@ import { io } from 'socket.io-client';
 const App = () => {
   const socketRef = useRef(null);
   const audioRef = useRef(null);
-  const audioPermissionAskedRef = useRef(false);
-  const audioEnabledRef = useRef(false);
   const pendingNotificationRef = useRef(null);
   const notificationCounterRef = useRef(0);
   const [notifications, setNotifications] = useState([]);
   const [showAudioPermissionModal, setShowAudioPermissionModal] = useState(false);
+  const [serviceWorkerStatus, setServiceWorkerStatus] = useState('checking...');
 
   useEffect(() => {
+    // Initialize User ID
+    const userId = localStorage.getItem('userId') || `user-${Date.now()}`;
+    localStorage.setItem('userId', userId);
+
+    // Register Service Worker and subscribe to push
+    initializeNotifications(userId);
+
     // Pre-load audio
     audioRef.current = new Audio('/notification.mp3');
     audioRef.current.load();
@@ -22,19 +28,22 @@ const App = () => {
     const socket = socketRef.current;
     socket.on('connect', () => {
       console.log('Connected to server:', socket.id);
-
-      // Register user with a unique ID (could be from login, localStorage, etc.)
-      const userId = localStorage.getItem('userId') || `user-${Date.now()}`;
-      localStorage.setItem('userId', userId);
       socket.emit('register', userId);
+
+      // Re-sync push subscription on reconnection (e.g. if server restarted)
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.ready.then((registration) => {
+          subscribeToPushNotifications(registration, userId);
+        });
+      }
+    });
+
+    socket.on('init', (data) => {
+      console.log('Server init:', data);
     });
 
     socket.on('disconnect', () => {
       console.log('Disconnected from server');
-    });
-
-    socket.on('init', (data) => {
-      console.log('Init data:', data);
     });
 
     socket.on('notification', (data) => {
@@ -46,26 +55,22 @@ const App = () => {
         return;
       }
 
-      console.log('Notification.permission', Notification.permission);
-
+      // If we have permission, show it.
+      // Note: We removed the visibility check so this works in background too.
       if (Notification.permission === "granted") {
-        handleNotification(data);
+        sendPushNotification(data, localStorage.getItem('audioPermission') === 'enabled');
       } else if (Notification.permission !== "denied") {
         Notification.requestPermission().then(function (permission) {
           if (permission === "granted") {
-            handleNotification(data);
-          } else {
-            alert("Notification permission denied. Please enable notifications for this website.");
+            sendPushNotification(data, localStorage.getItem('audioPermission') === 'enabled');
           }
         });
       }
     });
 
-    // Cleanup on component unmount
     return () => {
       socket.off('connect');
       socket.off('disconnect');
-      socket.off('init');
       socket.off('notification');
       socket.disconnect();
       if (audioRef.current) {
@@ -75,41 +80,105 @@ const App = () => {
     };
   }, []);
 
-  const handleNotification = (data) => {
-    // If audio permission not asked yet, show modal
-    if (!audioPermissionAskedRef.current) {
-      pendingNotificationRef.current = data;
-      setShowAudioPermissionModal(true);
+  const initializeNotifications = async (userId) => {
+    if ('serviceWorker' in navigator) {
+      try {
+        // Register Service Worker
+        const registration = await navigator.serviceWorker.register('/service-worker.js');
+        console.log('Service Worker registered:', registration);
+        setServiceWorkerStatus('registered ✓');
+
+        // Wait for service worker to be ready
+        await navigator.serviceWorker.ready;
+
+        // Subscribe to push notifications
+        await subscribeToPushNotifications(registration, userId);
+      } catch (error) {
+        console.error('Service Worker registration failed:', error);
+        setServiceWorkerStatus('failed ✗');
+      }
     } else {
-      sendPushNotification(data);
+      console.warn('Service Workers not supported');
+      setServiceWorkerStatus('not supported');
     }
   };
 
-  const handleEnableAudio = () => {
-    audioPermissionAskedRef.current = true;
+  const subscribeToPushNotifications = async (registration, userId) => {
+    try {
+      // Check if already subscribed
+      let subscription = await registration.pushManager.getSubscription();
 
-    // Play audio immediately during user interaction
+      if (!subscription) {
+        console.log('No existing subscription, creating new one...');
+        // Get VAPID public key from server
+        const response = await fetch('http://localhost:4001/api/vapid-public-key');
+        const { publicKey } = await response.json();
+
+        // Convert VAPID key to Uint8Array
+        const convertedVapidKey = urlBase64ToUint8Array(publicKey);
+
+        // Subscribe to push notifications
+        subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: convertedVapidKey
+        });
+      } else {
+        console.log('Found existing subscription');
+      }
+
+      console.log('Push subscription:', subscription);
+
+      // Send subscription to server via API
+      const responseOfSubscription = await fetch('http://localhost:4001/api/subscribe', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ userId, subscription }),
+      }).then((response) => response.json());
+      console.log('Subscription sent to server', responseOfSubscription);
+
+    } catch (error) {
+      console.error('Failed to subscribe to push notifications:', error);
+    }
+  };
+
+  // Helper function to convert VAPID key
+  const urlBase64ToUint8Array = (base64String) => {
+    const padding = '='.repeat((4 - base64String.length % 4) % 4);
+    const base64 = (base64String + padding)
+      .replace(/\-/g, '+')
+      .replace(/_/g, '/');
+
+    const rawData = window.atob(base64);
+    const outputArray = new Uint8Array(rawData.length);
+
+    for (let i = 0; i < rawData.length; ++i) {
+      outputArray[i] = rawData.charCodeAt(i);
+    }
+    return outputArray;
+  };
+
+  const handleEnableAudio = () => {
+    localStorage.setItem('audioPermission', 'enabled');
+
     if (audioRef.current) {
       audioRef.current.play()
         .then(() => {
-          audioEnabledRef.current = true;
           console.log('Audio enabled successfully');
           setShowAudioPermissionModal(false);
 
-          // Send the pending notification
           if (pendingNotificationRef.current) {
-            sendPushNotification(pendingNotificationRef.current);
+            sendPushNotification(pendingNotificationRef.current, true);
             pendingNotificationRef.current = null;
           }
         })
         .catch((error) => {
           console.error('Failed to enable audio:', error);
-          audioEnabledRef.current = false;
           setShowAudioPermissionModal(false);
 
-          // Still send notification, just without sound
           if (pendingNotificationRef.current) {
-            sendPushNotification(pendingNotificationRef.current);
+            sendPushNotification(pendingNotificationRef.current, false);
             pendingNotificationRef.current = null;
           }
         });
@@ -117,19 +186,17 @@ const App = () => {
   };
 
   const handleDisableAudio = () => {
-    audioPermissionAskedRef.current = true;
-    audioEnabledRef.current = false;
+    localStorage.setItem('audioPermission', 'disabled');
     setShowAudioPermissionModal(false);
 
-    // Send the pending notification without sound
     if (pendingNotificationRef.current) {
-      sendPushNotification(pendingNotificationRef.current);
+      sendPushNotification(pendingNotificationRef.current, false);
       pendingNotificationRef.current = null;
     }
   };
 
   const playNotificationSound = () => {
-    if (audioRef.current && audioEnabledRef.current) {
+    if (audioRef.current) {
       audioRef.current.currentTime = 0;
       audioRef.current.play().catch((error) => {
         console.error('Audio play failed:', error);
@@ -137,46 +204,45 @@ const App = () => {
     }
   };
 
-  const sendPushNotification = (data) => {
-    // Increment counter to create unique tag for each notification
+  const sendPushNotification = (data, playSound = false) => {
     notificationCounterRef.current += 1;
 
+    // Only show notification if page is visible (app is open)
+    // When app is closed, service worker handles it automatically
     var notification = new Notification(data.message, {
       body: data?.body || undefined,
       icon: '/notification-bell.png',
-      tag: `notification-${notificationCounterRef.current}`, // Unique tag for each notification
-      // Or remove tag completely to show all notifications:
-      // (don't include tag property at all)
+      tag: `notification-${notificationCounterRef.current}`,
     });
 
-    // Play notification sound
-    playNotificationSound();
+    if (playSound) {
+      playNotificationSound();
+    }
 
     notification.onclick = function () {
       if (data.url) {
         window.open(data.url);
       }
     };
-
-    notification.onclose = function () {
-      console.log('Notification closed');
-    };
-
-    notification.onerror = function (error) {
-      console.error('Notification error', error);
-    };
+    // When app is closed/minimized, the service worker's 'push' event 
+    // will automatically handle showing the notification
   };
 
   return (
     <div style={{ padding: '20px' }}>
       <h1>Socket.IO Notification App</h1>
+      <p style={{ fontSize: '12px', color: '#666' }}>
+        Service Worker: {serviceWorkerStatus}
+      </p>
+      <p style={{ fontSize: '12px', color: '#666', marginTop: '5px' }}>
+        ✓ Notifications work even when app is closed
+      </p>
       <ul>
         {notifications.map((notification, index) => (
           <li key={index}>{notification.message}</li>
         ))}
       </ul>
 
-      {/* Audio Permission Modal */}
       {showAudioPermissionModal && (
         <div style={{
           position: 'fixed',
